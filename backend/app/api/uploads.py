@@ -1,75 +1,102 @@
-"""Phase 2 — POST /api/upload (API_SPEC.md §1, ingestion scope only).
-
-Stores the source file immutably and creates document metadata with status
-UPLOADED. It does NOT parse/validate records — that is POST /api/process.
-A 201 here means "stored", never "fully processed".
-
-Requires authentication (any role); uploads are attributed to the caller.
-"""
+"""Upload endpoints matching API_SPEC.md §1."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
-from fastapi.responses import JSONResponse
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 
-from ..services import auth as auth_svc
-from ..services.validation import (
-    MAX_FILE_SIZE_BYTES,
-    IngestionError,
-)
-from .deps import error_response, get_service, ok
+from app.api.deps import get_current_user, get_doc_store
+from app.database.documents import DocumentStore
+from app.schemas.common import StandardResponse
+from app.schemas.uploads import UploadMetadata
+from app.services.audit import record_audit_event
+from app.services.validation import validate_upload
 
-router = APIRouter()
+router = APIRouter(prefix="/upload", tags=["upload"])
 
-_CHUNK = 1024 * 1024
-
-
-@router.post("/upload", status_code=201)
+@router.post("", response_model=StandardResponse[UploadMetadata], status_code=201)
 async def upload_file(
-    file: UploadFile | None = None,
+    file: UploadFile = File(...),
     dataset_type: str = Form(...),
-    source_name: str | None = Form(None),
-    description: str | None = Form(None),
-    user: dict = Depends(auth_svc.require_user),
+    source_name: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    store: DocumentStore = Depends(get_doc_store),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    if file is None or not file.filename:
-        return JSONResponse(
-            status_code=400,
-            content={"success": False,
-                     "error": {"code": "MISSING_FILE",
-                               "message": "Multipart field 'file' is required.",
-                               "details": []}},
-        )
-    try:
-        # Stream with a hard cap: never buffer an unbounded upload.
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            piece = await file.read(_CHUNK)
-            if not piece:
-                break
-            total += len(piece)
-            if total > MAX_FILE_SIZE_BYTES:
-                raise IngestionError(
-                    "FILE_TOO_LARGE",
-                    "File exceeds the size limit.", http_status=413)
-            chunks.append(piece)
-        content = b"".join(chunks)
-        document = get_service().upload(
-            content, file.filename, dataset_type.strip().upper(),
-            source_name=source_name, description=description,
-            uploaded_by=user["id"])
-    except IngestionError as exc:
-        return error_response(exc)
-    meta = document["metadata"]
-    return ok(
-        {"upload_id": document["id"], "dataset_type": document["type"],
-         "filename": document["filename"],
-         "size_bytes": meta.get("size_bytes"),
-         "record_count": meta.get("record_count"),
-         "status": document["status"], "source_id": document["id"],
-         "uploaded_at": document["uploaded_at"],
-         "uploaded_by": document["uploaded_by"]},
-        "File uploaded and stored. Run POST /api/process to validate it.",
-        status_code=201,
+    content = await file.read()
+    valid, msg, record_count = validate_upload(file.filename or "upload.csv", dataset_type, content)
+    if not valid:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
+
+    upload_id = f"upl_{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    raw_text = content.decode("utf-8", errors="replace")
+
+    upload_record = {
+        "id": upload_id,
+        "filename": file.filename,
+        "dataset_type": dataset_type.upper(),
+        "size_bytes": len(content),
+        "record_count": record_count,
+        "status": "UPLOADED",
+        "source_id": f"SRC_{datetime.now().year}_{uuid.uuid4().hex[:4].upper()}",
+        "source_name": source_name or file.filename,
+        "description": description or "",
+        "raw_content": raw_text,
+        "uploaded_by": current_user["id"],
+        "uploaded_at": now,
+    }
+
+    store.create_upload(upload_record)
+    record_audit_event(
+        store=store,
+        actor=current_user["id"],
+        action="UPLOAD",
+        entity_type=dataset_type.upper(),
+        entity_id=upload_id,
+        input_data={"filename": file.filename, "size": len(content)},
+        output_data={"upload_id": upload_id, "record_count": record_count},
     )
+
+    metadata = UploadMetadata(
+        upload_id=upload_id,
+        dataset_type=dataset_type.upper(),
+        filename=file.filename or "upload.csv",
+        size_bytes=len(content),
+        record_count=record_count,
+        status="UPLOADED",
+        source_id=upload_record["source_id"],
+        source_name=upload_record["source_name"],
+        description=upload_record["description"],
+        uploaded_at=now,
+        uploaded_by=current_user["id"],
+    )
+
+    return StandardResponse(data=metadata, message="File uploaded and queued for validation.")
+
+@router.get("", response_model=StandardResponse[List[UploadMetadata]])
+def list_uploads(
+    store: DocumentStore = Depends(get_doc_store),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    uploads = store.list_uploads()
+    res = [
+        UploadMetadata(
+            upload_id=u["id"],
+            dataset_type=u["dataset_type"],
+            filename=u["filename"],
+            size_bytes=u["size_bytes"],
+            record_count=u.get("record_count", 0),
+            status=u.get("status", "UPLOADED"),
+            source_id=u.get("source_id"),
+            source_name=u.get("source_name"),
+            description=u.get("description"),
+            uploaded_at=u["uploaded_at"],
+            uploaded_by=u["uploaded_by"],
+        )
+        for u in uploads
+    ]
+    return StandardResponse(data=res, message="Uploads retrieved.")

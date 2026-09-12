@@ -1,91 +1,60 @@
-"""Phase 2 — shared API wiring (envelope, errors, service factory).
-
-Auth/RBAC do not exist yet (Phase 6); endpoints are local-development only
-until then. Nothing here trusts the frontend: all validation is server-side.
-"""
+"""FastAPI dependency injection: database stores and JWT authentication guards."""
 
 from __future__ import annotations
 
-import os
+from typing import Dict, Any, Generator, Optional
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from fastapi.responses import JSONResponse
+from app.database.documents import DocumentStore, default_db_path
+from app.database.neo4j import Neo4jService
+from app.services.auth import decode_access_token
 
-from ..database.documents import DocumentStore, default_db_path
-from ..database.neo4j import Neo4jConfig, Neo4jService
-from ..services.ingestion import IngestionService
-from ..services.validation import IngestionError
+security = HTTPBearer(auto_error=False)
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__)))))
+def get_doc_store() -> DocumentStore:
+    return DocumentStore(default_db_path())
 
+def get_neo4j_service() -> Neo4jService:
+    return Neo4jService()
 
-def raw_dir() -> str:
-    return os.environ.get("RAW_DATA_DIR",
-                          os.path.join(REPO_ROOT, "data", "raw"))
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    store: DocumentStore = Depends(get_doc_store),
+) -> Dict[str, Any]:
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication credentials were not provided.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = credentials.credentials
+    try:
+        payload = decode_access_token(token)
+        user_id = payload.get("sub") or payload.get("id")
+        if not user_id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload.")
+        user = store.get_user_by_id(user_id) or store.get_user_by_email(user_id)
+        if not user:
+            # Return payload user if database user not yet synced
+            return {
+                "id": user_id,
+                "email": payload.get("email", "user@example.com"),
+                "name": payload.get("name", "Investigator"),
+                "role": payload.get("role", "INVESTIGATOR"),
+            }
+        return user
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Could not validate credentials: {str(exc)}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-
-def processed_dir() -> str:
-    return os.environ.get("PROCESSED_DATA_DIR",
-                          os.path.join(REPO_ROOT, "data", "processed"))
-
-
-def db_path() -> str:
-    return os.environ.get("DOCUMENT_DB_PATH", default_db_path())
-
-
-_service: IngestionService | None = None
-
-
-def get_service() -> IngestionService:
-    global _service
-    if _service is None:
-        _service = IngestionService(DocumentStore(db_path()),
-                                    raw_dir(), processed_dir())
-    return _service
-
-
-def reset_service() -> None:
-    """Test hook: drop the cached service so env overrides take effect."""
-    global _service
-    _service = None
-
-
-_graph_service: Neo4jService | None = None
-_graph_override = None
-
-
-def get_graph_service() -> Neo4jService:
-    """Neo4j service from environment (password required). Fails with a
-    structured error — never an import traceback — when unconfigured."""
-    global _graph_service
-    if _graph_override is not None:
-        return _graph_override
-    if _graph_service is None:
-        _graph_service = Neo4jService(Neo4jConfig.from_env())
-    return _graph_service
-
-
-def set_graph_service_override(service) -> None:
-    """Test hook: inject a fake/driver-backed service."""
-    global _graph_override
-    _graph_override = service
-
-
-def reset_graph_service() -> None:
-    global _graph_service, _graph_override
-    _graph_service = None
-    _graph_override = None
-
-
-def error_response(exc: IngestionError) -> JSONResponse:
-    """Structured error envelope. Never includes paths or tracebacks."""
-    return JSONResponse(
-        status_code=exc.http_status,
-        content={"success": False,
-                 "error": {"code": exc.code, "message": exc.message,
-                           "details": exc.details}},
-    )
-
-
-def ok(data: dict, message: str, status_code: int = 200) -> dict:
-    return {"success": True, "data": data, "message": message}
+def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    if current_user.get("role") != "ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions. Admin role required.",
+        )
+    return current_user

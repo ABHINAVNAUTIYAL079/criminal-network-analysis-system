@@ -1,126 +1,85 @@
-"""Phase 4 — Neo4j connection/service layer.
-
-Configuration comes only from environment variables; nothing is hardcoded
-and credentials never appear in logs or API responses::
-
-    NEO4J_URI        e.g. bolt://localhost:7687 (default; honors
-                     NEO4J_BOLT_PORT for docker-compose parity)
-    NEO4J_USERNAME   (fallback: NEO4J_USER, then "neo4j")
-    NEO4J_PASSWORD   required — missing value is a startup-clear 500
-    NEO4J_DATABASE   default "neo4j"
-
-The ``neo4j`` driver is imported lazily so this module (and the whole app)
-imports cleanly where the driver is absent; connection attempts then fail
-with an explicit structured error instead of an ImportError traceback.
-"""
+"""Neo4j knowledge graph database connection and execution service."""
 
 from __future__ import annotations
 
-import contextlib
 import os
-import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
-from ..services.validation import IngestionError
+try:
+    from neo4j import GraphDatabase, Driver, Session
+except ImportError:
+    GraphDatabase = None
+    Driver = None
+    Session = None
 
-QUERY_TIMEOUT_SECONDS = 10.0
+from app.config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
 
-
-class Neo4jConfigError(IngestionError):
-    def __init__(self, message: str) -> None:
-        super().__init__("NEO4J_CONFIG_ERROR", message, http_status=500)
-
-
-class Neo4jUnavailable(IngestionError):
-    def __init__(self, message: str) -> None:
-        super().__init__("NEO4J_UNAVAILABLE", message, http_status=503)
-
-
-def _redact(text: str) -> str:
-    """Strip any embedded credentials before a message leaves this module."""
-    return re.sub(r"://[^/@]*@", "://***@", str(text))
-
-
+@dataclass
 class Neo4jConfig:
-    def __init__(self, uri: str, username: str, password: str,
-                 database: str) -> None:
-        self.uri = uri
-        self.username = username
-        self.password = password
-        self.database = database
-
-    @classmethod
-    def from_env(cls, env: dict | None = None) -> "Neo4jConfig":
-        env = env if env is not None else os.environ
-        bolt_port = env.get("NEO4J_BOLT_PORT", "7687")
-        uri = env.get("NEO4J_URI") or f"bolt://localhost:{bolt_port}"
-        username = env.get("NEO4J_USERNAME") or env.get("NEO4J_USER") or "neo4j"
-        password = env.get("NEO4J_PASSWORD")
-        if not password:
-            raise Neo4jConfigError(
-                "NEO4J_PASSWORD is not set. Copy .env.example to .env and "
-                "fill in a local-only password (never commit it).")
-        database = env.get("NEO4J_DATABASE", "neo4j")
-        return cls(uri=uri, username=username, password=password,
-                   database=database)
-
-    def describe(self) -> dict:
-        """Log/API-safe description — never includes the password."""
-        return {"uri": self.uri, "username": self.username,
-                "database": self.database}
-
+    uri: str = NEO4J_URI
+    user: str = NEO4J_USER
+    password: str = NEO4J_PASSWORD
 
 class Neo4jService:
-    """Thin wrapper around the official driver: sessions, health checks,
-    and schema bootstrap. Accepts any session factory with a compatible
-    ``session()`` for tests (see backend/tests/fakes.py)."""
+    def __init__(self, config: Optional[Neo4jConfig] = None):
+        self.config = config or Neo4jConfig()
+        self._driver: Optional[Driver] = None
 
-    def __init__(self, config: Neo4jConfig, driver=None) -> None:
-        self.config = config
-        self._driver = driver
-
-    def _driver_or_connect(self):
-        if self._driver is not None:
-            return self._driver
-        try:
-            from neo4j import GraphDatabase
-        except ImportError as exc:
-            raise Neo4jUnavailable(
-                "The 'neo4j' driver package is not installed.") from exc
-        try:
-            self._driver = GraphDatabase.driver(
-                self.config.uri,
-                auth=(self.config.username, self.config.password))
-            self._driver.verify_connectivity()
-        except Exception as exc:
-            raise Neo4jUnavailable(
-                f"Neo4j unavailable at {self.config.uri}: "
-                f"{_redact(str(exc) or type(exc).__name__)}") from exc
+    def get_driver(self) -> Optional[Driver]:
+        if self._driver is None and GraphDatabase is not None:
+            try:
+                self._driver = GraphDatabase.driver(
+                    self.config.uri,
+                    auth=(self.config.user, self.config.password),
+                    max_connection_lifetime=30 * 60,
+                    max_connection_pool_size=50,
+                )
+            except Exception as e:
+                self._driver = None
         return self._driver
-
-    def verify(self) -> dict:
-        """Connectivity probe. Raises Neo4jUnavailable on any failure."""
-        driver = self._driver_or_connect()
-        try:
-            driver.verify_connectivity()
-        except Exception as exc:
-            raise Neo4jUnavailable(
-                f"Neo4j unavailable at {self.config.uri}: "
-                f"{_redact(str(exc) or type(exc).__name__)}") from exc
-        return {"ok": True, **self.config.describe()}
-
-    @contextlib.contextmanager
-    def session(self):
-        """Yield a driver session bound to the configured database."""
-        driver = self._driver_or_connect()
-        session = driver.session(database=self.config.database)
-        try:
-            yield session
-        finally:
-            session.close()
 
     def close(self) -> None:
         if self._driver is not None:
-            try:
-                self._driver.close()
-            finally:
-                self._driver = None
+            self._driver.close()
+            self._driver = None
+
+    def execute_query(
+        self, query: str, parameters: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """Executes a Cypher query with parameters and returns list of record dicts."""
+        driver = self.get_driver()
+        if driver is None:
+            return []
+        try:
+            with driver.session() as session:
+                result = session.run(query, parameters or {})
+                return [record.data() for record in result]
+        except Exception as e:
+            return []
+
+    def execute_write(
+        self, query: str, parameters: Optional[Dict[str, Any]] = None
+    ) -> Any:
+        """Executes a Cypher write transaction with parameters."""
+        driver = self.get_driver()
+        if driver is None:
+            return None
+        try:
+            with driver.session() as session:
+                return session.execute_write(
+                    lambda tx: [r.data() for r in tx.run(query, parameters or {})]
+                )
+        except Exception as e:
+            return None
+
+    def is_connected(self) -> bool:
+        driver = self.get_driver()
+        if driver is None:
+            return False
+        try:
+            with driver.session() as session:
+                res = session.run("RETURN 1 AS test").single()
+                return res and res["test"] == 1
+        except Exception:
+            return False

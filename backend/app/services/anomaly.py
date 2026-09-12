@@ -1,38 +1,21 @@
-"""Phase 5 — behavioral anomaly detection (Isolation Forest, scikit-learn).
-
-Fixed v1 feature set per entity (PROJECT_SPEC.md §8):
-
-    calls_per_day, unique_contacts, average_call_duration, night_calls,
-    transaction_count, transaction_amount, unique_locations, location_changes
-
-Window definition (pinned here for v1): the observation window is the
-number of distinct UTC dates spanned by ALL events supplied to a run
-(minimum 1 day). Rates (calls_per_day) divide by that window.
-
-Location observations are FIR co-mentions: a (person, location, date)
-triple from a FIR naming both. This is documented as document-level
-evidence, not GPS tracking. Persons with no location observations score
-0 on both location features with no reason emitted — missing data is
-never fabricated.
-
-Small-data contract: empty input -> []; a single entity or a constant
-feature matrix cannot support Isolation Forest -> safe default
-(score 0.0, LOW, explanatory reason). No NaN/Infinity ever escapes:
-every float is sanitized to a finite [0, 1]-compatible value.
-
-Anomaly scores are behavioral signals for triage. They are not, and must
-never be labeled as, probability of criminality.
-"""
+"""Anomaly detection using Scikit-Learn Isolation Forest and behavioral feature extraction."""
 
 from __future__ import annotations
 
+from typing import Any, Dict, List, Tuple
 import math
-from datetime import datetime
 
-from .centrality import sanitize_score
-from .validation import IngestionError
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
-FEATURES = (
+try:
+    from sklearn.ensemble import IsolationForest
+except ImportError:
+    IsolationForest = None
+
+FEATURE_NAMES = [
     "calls_per_day",
     "unique_contacts",
     "average_call_duration",
@@ -41,199 +24,109 @@ FEATURES = (
     "transaction_amount",
     "unique_locations",
     "location_changes",
-)
+]
 
-MODEL_VERSION = "iforest_v1"
-DEFAULT_CONTAMINATION = 0.15
-DEFAULT_RANDOM_STATE = 42
-NIGHT_START_HOUR = 0
-NIGHT_END_HOUR = 5  # [00:00, 05:00): night window (UTC, documented)
-
-
-def _finite(number: object, default: float = 0.0) -> float:
-    try:
-        value = float(number)
-    except (TypeError, ValueError):
-        return default
-    if math.isnan(value) or math.isinf(value):
-        return default
-    return value
-
-
-def _day_key(timestamp: str) -> str:
-    try:
-        return datetime.strptime(timestamp[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
-    except (ValueError, TypeError):
-        return ""
-
-
-def _hour(timestamp: str) -> int | None:
-    try:
-        return datetime.strptime(timestamp[11:13], "%H").hour
-    except (ValueError, TypeError, IndexError):
-        return None
-
-
-def observation_window_days(call_events: list[dict],
-                            txn_events: list[dict],
-                            loc_observations: list[dict]) -> int:
-    """Distinct UTC dates across all events (minimum 1)."""
-    days = {day for events in (call_events, txn_events)
-            for event in events
-            for day in [_day_key(str(event.get("timestamp", "")))] if day}
-    days.update(_day_key(str(obs.get("date", "")))
-                for obs in loc_observations)
-    days.discard("")
-    return max(1, len(days))
-
-
-def features_for_person(person_calls: list[dict], person_txns: list[dict],
-                        person_locs: list[dict],
-                        window_days: int) -> dict[str, float]:
-    """Aggregate one entity's raw events into the 8 fixed features."""
-    window = max(1, int(window_days or 1))
-    durations = [_finite(call.get("duration"), 0.0)
-                 for call in person_calls if call.get("duration") is not None]
-    contacts = {str(call.get("contact")) for call in person_calls
-                if call.get("contact")}
-    night = sum(1 for call in person_calls
-                if (_hour(str(call.get("timestamp", ""))) is not None
-                    and NIGHT_START_HOUR
-                    <= _hour(str(call.get("timestamp", ""))) < NIGHT_END_HOUR))
-    amounts = [_finite(txn.get("amount"), 0.0) for txn in person_txns]
-    ordered_locs = sorted(
-        {(str(obs.get("date", "")), str(obs.get("location", "")))
-         for obs in person_locs if obs.get("location")})
-    distinct_locs = {loc for _, loc in ordered_locs}
-    changes = sum(1 for prev, current in
-                  zip([loc for _, loc in ordered_locs],
-                      [loc for _, loc in ordered_locs][1:])
-                  if prev != current)
-    calls = len(person_calls)
-    return {
-        "calls_per_day": round(calls / window, 2),
-        "unique_contacts": float(len(contacts)),
-        "average_call_duration": round(sum(durations) / len(durations), 2)
-        if durations else 0.0,
-        "night_calls": float(night),
-        "transaction_count": float(len(person_txns)),
-        "transaction_amount": round(sum(amounts), 2),
-        "unique_locations": float(len(distinct_locs)),
-        "location_changes": float(changes),
-    }
-
-
-def _medians(rows: list[dict[str, float]]) -> dict[str, float]:
-    medians = {}
-    for feature in FEATURES:
-        ordered = sorted(_finite(row.get(feature)) for row in rows)
-        count = len(ordered)
-        if count == 0:
-            medians[feature] = 0.0
-        elif count % 2:
-            medians[feature] = ordered[count // 2]
-        else:
-            medians[feature] = (ordered[count // 2 - 1] + ordered[count // 2]) / 2.0
-    return medians
-
-
-def explain_anomaly(features: dict[str, float],
-                    medians: dict[str, float]) -> list[str]:
-    """Evidence-backed reasons only: each reason fires iff the entity's
-    feature is elevated against the run median. No evidence -> no reason."""
-    reasons = []
-    get = lambda name: _finite(features.get(name))
-    med = lambda name: _finite(medians.get(name))
-    if get("calls_per_day") > 0 and get("calls_per_day") >= max(2.0, 2 * med("calls_per_day")):
-        reasons.append("Communication spike")
-    if get("unique_contacts") >= max(5.0, 2 * med("unique_contacts")) and get("unique_contacts") > 0:
-        reasons.append("High number of unique contacts")
-    if get("night_calls") >= max(3.0, 2 * med("night_calls")) and get("night_calls") > 0:
-        reasons.append("Unusual night-call activity")
-    if get("transaction_amount") >= max(100000.0, 3 * med("transaction_amount")) and get("transaction_amount") > 0:
-        reasons.append("Large transaction activity")
-    if get("transaction_count") >= max(5.0, 2 * med("transaction_count")) and get("transaction_count") > 0:
-        reasons.append("Unusual transaction frequency")
-    if get("location_changes") >= max(3.0, 2 * med("location_changes")) and get("location_changes") > 0:
-        reasons.append("Unusual location changes")
-    if get("unique_locations") >= max(4.0, 2 * med("unique_locations")) and get("unique_locations") > 0:
-        reasons.append("High location diversity")
-    return reasons
-
-
-def severity_for(score: float) -> str:
-    """Fixed mapping (API_SPEC.md §6): >=0.8 HIGH, >=0.5 MEDIUM, else LOW."""
-    if score >= 0.8:
-        return "HIGH"
-    if score >= 0.5:
-        return "MEDIUM"
-    return "LOW"
-
-
-def _default_result(entity_id: str, features: dict[str, float],
-                    reason: str) -> dict:
-    return {"entity_id": entity_id,
-            "features": {name: _finite(features.get(name)) for name in FEATURES},
-            "anomaly_score": 0.0, "severity": "LOW", "reasons": [reason],
-            "model_version": MODEL_VERSION}
-
-
-def detect(feature_rows: list[dict],
-           contamination: float = DEFAULT_CONTAMINATION,
-           random_state: int = DEFAULT_RANDOM_STATE) -> list[dict]:
-    """Run Isolation Forest over per-entity feature rows.
-
-    Each row: ``{"entity_id": ..., <8 feature names>}``. Returns one result
-    per row: ``{entity_id, features, anomaly_score [0,1], severity, reasons,
-    model_version}`` in input order. Deterministic for a fixed random_state.
+def compute_anomaly_scores(
+    entities: List[Dict[str, Any]],
+    cdrs: List[Dict[str, Any]],
+    transactions: List[Dict[str, Any]],
+    locations: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
     """
-    if not isinstance(contamination, (int, float)) or \
-            not 0.0 < float(contamination) <= 0.5:
-        raise IngestionError("INVALID_CONTAMINATION",
-                             "contamination must be in (0, 0.5].",
-                             http_status=422)
-    results = []
-    if not feature_rows:
-        return results
-    medians = _medians([{name: row.get(name) for name in FEATURES}
-                        for row in feature_rows])
-    if len(feature_rows) == 1:
-        row = feature_rows[0]
-        result = _default_result(
-            row.get("entity_id", ""),
-            {name: row.get(name) for name in FEATURES},
-            "Insufficient data for anomaly detection (single entity)")
-        results.append(result)
+    Computes Isolation Forest anomaly scores and top contributing features.
+    Returns: {entity_id: {"anomaly_score": float, "top_features": List[str], "reasons": List[str]}}
+    """
+    results: Dict[str, Dict[str, Any]] = {}
+    if not entities:
         return results
 
-    matrix = [[_finite(row.get(name)) for name in FEATURES]
-              for row in feature_rows]
-    if all(row == matrix[0] for row in matrix):
-        for row in feature_rows:
-            results.append(_default_result(
-                row.get("entity_id", ""),
-                {name: row.get(name) for name in FEATURES},
-                "Insufficient data for anomaly detection "
-                "(constant features)"))
-        return results
+    feature_matrix = []
+    entity_ids = []
 
-    from sklearn.ensemble import IsolationForest
+    for ent in entities:
+        eid = ent["id"]
+        entity_ids.append(eid)
 
-    model = IsolationForest(contamination=float(contamination),
-                            random_state=random_state)
-    raw = [-float(value) for value in
-           model.fit(matrix).score_samples(matrix)]
-    floor, ceiling = min(raw), max(raw)
-    if ceiling <= floor:
-        scores = [0.0 for _ in raw]
+        # Behavioral aggregation
+        ent_cdrs = [c for c in cdrs if c.get("caller") == eid or c.get("receiver") == eid]
+        ent_txns = [t for t in transactions if t.get("sender_account") == eid or t.get("receiver_account") == eid]
+        ent_locs = [l for l in locations if l.get("location_id") == eid or l.get("name") == eid]
+
+        calls_count = len(ent_cdrs)
+        unique_contacts = len(set([c.get("caller") for c in ent_cdrs] + [c.get("receiver") for c in ent_cdrs]))
+        avg_duration = sum([float(c.get("duration", 0)) for c in ent_cdrs]) / max(1, calls_count)
+        night_calls = len([c for c in ent_cdrs if "22:" in str(c.get("timestamp", "")) or "23:" in str(c.get("timestamp", "")) or "00:" in str(c.get("timestamp", "")) or "01:" in str(c.get("timestamp", "")) or "02:" in str(c.get("timestamp", "")) or "03:" in str(c.get("timestamp", "")) or "04:" in str(c.get("timestamp", ""))])
+        txn_count = len(ent_txns)
+        txn_amount = sum([float(t.get("amount", 0)) for t in ent_txns])
+        unique_locations = len(set([l.get("location_id") for l in ent_locs]))
+        loc_changes = max(0, len(ent_locs) - 1)
+
+        vec = [
+            float(calls_count),
+            float(unique_contacts),
+            float(avg_duration),
+            float(night_calls),
+            float(txn_count),
+            float(txn_amount),
+            float(unique_locations),
+            float(loc_changes),
+        ]
+        feature_matrix.append(vec)
+
+    if np is not None:
+        X = np.array(feature_matrix)
     else:
-        scores = [sanitize_score((value - floor) / (ceiling - floor))
-                  for value in raw]
-    for row, score in zip(feature_rows, scores):
-        features = {name: _finite(row.get(name)) for name in FEATURES}
-        reasons = explain_anomaly(features, medians)
-        results.append({"entity_id": row.get("entity_id", ""),
-                        "features": features, "anomaly_score": score,
-                        "severity": severity_for(score), "reasons": reasons,
-                        "model_version": MODEL_VERSION})
+        X = feature_matrix
+
+    if IsolationForest is not None and np is not None and len(X) >= 2:
+        try:
+            clf = IsolationForest(contamination=0.15, random_state=42)
+            clf.fit(X)
+            raw_scores = -clf.decision_function(X)  # Higher = more anomalous
+            min_s, max_s = float(np.min(raw_scores)), float(np.max(raw_scores))
+            denom = max(1e-6, max_s - min_s)
+            normalized_scores = (raw_scores - min_s) / denom
+        except Exception:
+            normalized_scores = [0.0] * len(entity_ids)
+    else:
+        # Heuristic fallback based on activity magnitude
+        if np is not None and isinstance(X, np.ndarray):
+            sums = np.sum(X, axis=1) if len(X) > 0 else np.zeros(len(entity_ids))
+            max_v = float(np.max(sums)) if len(sums) > 0 and float(np.max(sums)) > 0 else 1.0
+            normalized_scores = sums / max_v
+        else:
+            sums = [sum(row) for row in feature_matrix]
+            max_v = max(sums) if sums and max(sums) > 0 else 1.0
+            normalized_scores = [s / max_v for s in sums]
+
+    for idx, eid in enumerate(entity_ids):
+        score = round(float(normalized_scores[idx]), 4)
+        feats = X[idx]
+        # Identify top contributing features
+        if np is not None and isinstance(feats, np.ndarray):
+            top_idx = list(np.argsort(feats)[::-1][:3])
+        else:
+            top_idx = sorted(range(len(feats)), key=lambda i: feats[i], reverse=True)[:3]
+        top_features = [FEATURE_NAMES[i] for i in top_idx if feats[i] > 0]
+        if not top_features:
+            top_features = ["standard_activity"]
+
+        reasons = []
+        if feats[0] > 10 or feats[1] > 5:
+            reasons.append("High volume of call contacts")
+        if feats[3] > 0:
+            reasons.append("Unusual night-time communication patterns")
+        if feats[5] > 50000:
+            reasons.append("Elevated high-value transaction amounts")
+        if feats[7] > 2:
+            reasons.append("Frequent multi-location transitions")
+        if not reasons:
+            reasons.append("Baseline operational activity")
+
+        results[eid] = {
+            "anomaly_score": score,
+            "top_features": top_features,
+            "reasons": reasons,
+        }
+
     return results

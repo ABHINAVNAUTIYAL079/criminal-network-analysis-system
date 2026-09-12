@@ -1,31 +1,31 @@
-"""Phase 6 — auth request schemas (pydantic, via FastAPI)."""
+"""Auth and user schemas."""
 
-from pydantic import BaseModel, ConfigDict, Field
+from __future__ import annotations
 
+from typing import List, Optional
+from pydantic import BaseModel, EmailStr, Field
 
 class LoginRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    username: Optional[str] = None
+    email: Optional[str] = None
+    password: str
 
-    username: str = Field(min_length=1, max_length=256)
-    password: str = Field(min_length=1, max_length=256)
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int = 86400
+    user: UserProfile
 
-
-class RefreshRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    refresh_token: str = Field(min_length=1, max_length=4096)
-
+class UserProfile(BaseModel):
+    id: str
+    name: str
+    email: str
+    role: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
 
 class CreateUserRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(min_length=1, max_length=128)
-    email: str = Field(min_length=3, max_length=256)
-    password: str = Field(min_length=1, max_length=256)
-    role: str = Field(min_length=1, max_length=32)
-
-
-class SetRoleRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    role: str = Field(min_length=1, max_length=32)
+    name: str
+    email: str
+    password: str = Field(min_length=8)
+    role: str = "INVESTIGATOR"

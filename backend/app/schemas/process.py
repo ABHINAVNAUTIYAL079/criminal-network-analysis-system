@@ -1,25 +1,26 @@
-"""Phase 2 — API request schemas (pydantic, via FastAPI).
+"""Process schemas matching API_SPEC.md §2."""
 
-Only shapes the service layer does not already validate; services remain
-stdlib-only so they stay testable without web dependencies.
-"""
+from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
 
-from pydantic import BaseModel, ConfigDict, Field
-
-ProcessOptions = dict  # validated loosely; unknown flags are ignored
-
+class ProcessOptions(BaseModel):
+    extract_entities: bool = True
+    resolve_entities: bool = True
+    build_graph: bool = True
+    run_analytics: bool = True
 
 class ProcessRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    upload_id: str
+    options: ProcessOptions = Field(default_factory=ProcessOptions)
 
-    upload_id: str = Field(min_length=1, max_length=64,
-                           pattern=r"^[A-Za-z0-9_-]{1,64}$")
-    options: dict = Field(default_factory=dict)
-
-
-class JobResponse(BaseModel):
+class ProcessJobStatus(BaseModel):
     job_id: str
     upload_id: str
-    status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "PARTIAL"]
+    status: str
+    stages: List[str]
+    stage_statuses: Dict[str, str]
+    error_message: Optional[str] = None
+    created_at: str
+    updated_at: str

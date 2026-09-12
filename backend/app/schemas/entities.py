@@ -1,54 +1,77 @@
-"""Phase 3 — extract/resolve request schemas (pydantic, via FastAPI).
+"""Entity, Graph, and Analytics schemas."""
 
-Temp extraction IDs are echoed for traceability only; canonical IDs are
-always assigned server-side by the resolver and never accepted from input.
-"""
+from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
+from app.schemas.common import PaginationMeta
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+class SourceReference(BaseModel):
+    document_id: str
+    record_id: Optional[str] = None
+    offsets: Optional[List[int]] = None
+    confidence: float = 1.0
 
-EntityType = Literal["PERSON", "PHONE", "LOCATION", "VEHICLE",
-                     "ORGANIZATION", "DATE", "ACCOUNT"]
+class EntityListItem(BaseModel):
+    id: str
+    type: str
+    name: str
+    aliases: List[str] = Field(default_factory=list)
+    source_refs: List[SourceReference] = Field(default_factory=list)
+    confidence: float = 1.0
+    priority_score: float = 0.0
 
+class EntityListResponse(BaseModel):
+    items: List[EntityListItem]
+    pagination: PaginationMeta
 
-class ExtractRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class EntityDetail(BaseModel):
+    id: str
+    type: str
+    name: str
+    aliases: List[str] = Field(default_factory=list)
+    source_refs: List[SourceReference] = Field(default_factory=list)
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+    analytics_summary: Dict[str, Any] = Field(default_factory=dict)
+    related: List[Dict[str, Any]] = Field(default_factory=list)
 
-    upload_id: str | None = Field(default=None, max_length=64,
-                                  pattern=r"^[A-Za-z0-9_-]{1,64}$")
-    text: str | None = Field(default=None, max_length=200_000)
-    document_id: str | None = Field(default=None, max_length=64)
-    known_names: list[str] = Field(default_factory=list, max_length=5000)
-    known_locations: list[str] = Field(default_factory=list, max_length=5000)
+class GraphNode(BaseModel):
+    id: str
+    label: str
+    name: str
+    type: str
+    properties: Dict[str, Any] = Field(default_factory=dict)
 
-    @model_validator(mode="after")
-    def _exactly_one_source(self):
-        if bool(self.upload_id) == bool(self.text):
-            raise ValueError("Provide exactly one of upload_id or text.")
-        if self.text is not None and not self.document_id:
-            raise ValueError("document_id is required with text.")
-        return self
+class GraphEdge(BaseModel):
+    id: str
+    source: str
+    target: str
+    type: str
+    confidence: float = 1.0
+    method: str = "direct"
+    source_record_id: Optional[str] = None
+    properties: Dict[str, Any] = Field(default_factory=dict)
 
+class GraphData(BaseModel):
+    nodes: List[GraphNode]
+    edges: List[GraphEdge]
 
-class ExtractedEntity(BaseModel):
-    # Unknown fields are ignored (not trusted): extraction output carries
-    # provenance extras (raw_text, nlp_backend) that resolve does not need.
-    # Only the contract fields below are consumed.
-    model_config = ConfigDict(extra="ignore")
+class AnomalyExplanation(BaseModel):
+    entity_id: str
+    canonical_name: str
+    anomaly_score: float
+    priority_score: float
+    top_features: List[str]
+    reasons: List[str]
+    disclaimer: str = "Investigation Priority Score is a triage indicator, not proof of guilt or criminal activity."
 
-    id: str = Field(max_length=64)
-    type: EntityType
-    value: str = Field(min_length=1, max_length=1000)
-    confidence: float = Field(ge=0.0, le=1.0)
-    normalized_value: str | None = Field(default=None, max_length=256)
-    method: str | None = Field(default=None, max_length=64)
-
-
-class ResolveRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    document_id: str = Field(min_length=1, max_length=64)
-    entities: list[ExtractedEntity] = Field(max_length=500)
-    doc_attrs: dict = Field(default_factory=dict)
-    fuzzy_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
+class PriorityRankingItem(BaseModel):
+    entity_id: str
+    name: str
+    type: str
+    pagerank: float
+    betweenness: float
+    anomaly_score: float
+    priority_score: float
+    community_id: Optional[str] = None
+    top_features: List[str] = Field(default_factory=list)

@@ -1,61 +1,72 @@
-"""Crime Network Intelligence System — FastAPI entrypoint.
+"""Crime Network Intelligence System — FastAPI Main Application."""
 
-Phase 6: full application API — ingestion, NLP/resolution, knowledge
-graph, analytics/anomaly/priority, timeline, search, investigation, and
-JWT authentication with server-side RBAC. React dashboard is served
-separately (see frontend/). No external AI/data APIs
-(see PROJECT_SPEC.md phases).
-"""
+from __future__ import annotations
 
 import os
-
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from .api.analytics import router as analytics_router
-from .api.auth import router as auth_router
-from .api.deps import error_response
-from .api.entities import router as entities_router
-from .api.graph import router as graph_router
-from .api.process import router as process_router
-from .api.search import router as search_router
-from .api.timeline import router as timeline_router
-from .api.uploads import router as upload_router
-from .services.validation import IngestionError
+from app.api.analytics import router as analytics_router
+from app.api.auth import router as auth_router, users_router
+from app.api.entities import router as entities_router
+from app.api.graph import router as graph_router
+from app.api.process import router as process_router
+from app.api.search import reports_router, search_router, timeline_router
+from app.api.uploads import router as upload_router
+from app.schemas.common import ErrorPayload, StandardResponse
 
-app = FastAPI(title="Crime Network Intelligence System", version="0.7.0")
-
-# CORS: explicit frontend origin allowlist only — never "*" with credentials.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[origin.strip() for origin in
-                   os.environ.get("FRONTEND_URL",
-                                  "http://localhost:5173").split(",")
-                   if origin.strip()],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
-    max_age=600,
+app = FastAPI(
+    title="Crime Network Intelligence System API",
+    version="1.0.0",
+    description="Investigation-support platform for crime network intelligence and graph analytics.",
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
 )
 
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# API Routers mounting under /api prefix
+app.include_router(auth_router, prefix="/api")
+app.include_router(users_router, prefix="/api")
 app.include_router(upload_router, prefix="/api")
 app.include_router(process_router, prefix="/api")
 app.include_router(entities_router, prefix="/api")
 app.include_router(graph_router, prefix="/api")
 app.include_router(analytics_router, prefix="/api")
-app.include_router(auth_router, prefix="/api")
 app.include_router(search_router, prefix="/api")
 app.include_router(timeline_router, prefix="/api")
+app.include_router(reports_router, prefix="/api")
 
+@app.get("/health", response_model=StandardResponse[dict])
+@app.get("/api/health", response_model=StandardResponse[dict])
+def health_check():
+    return StandardResponse(
+        data={"status": "ok", "service": "crime-network-intelligence-api", "version": "1.0.0"},
+        message="Service is healthy.",
+    )
 
-@app.exception_handler(IngestionError)
-async def ingestion_error_handler(request, exc: IngestionError):
-    """Structured envelope for IngestionError raised anywhere — including
-    auth dependencies — so no failure ever leaks a traceback or 500."""
-    return error_response(exc)
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    # Log error internally and return safe generic error without leaking sensitive secrets
+    error_payload = ErrorPayload(
+        code="INTERNAL_SERVER_ERROR",
+        message="An unexpected server error occurred.",
+        details=[{"issue": str(exc)}],
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"success": False, "data": None, "message": "Internal error.", "error": error_payload.model_dump()},
+    )
 
-
-@app.get("/health")
-def health() -> dict:
-    """Liveness probe. Unauthenticated by design (see API_SPEC.md)."""
-    return {"success": True, "data": {"status": "ok"}, "message": "Backend is running."}
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True)

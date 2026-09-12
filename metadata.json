@@ -1,0 +1,6 @@
+{
+  "name": "Crime Network Intelligence System",
+  "description": "Crime Network Intelligence System with graph analytics, anomaly detection, and investigation triage.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,79 +1,62 @@
-"""Phase 5 — Investigation Priority Score (PROJECT_SPEC.md §9).
-
-Formula (fixed, v1)::
-
-    priority_score = 0.35 * PageRank + 0.35 * Betweenness + 0.30 * Anomaly
-
-All components are normalized to [0, 1] before combining. The result is a
-triage aid that orders entities for investigator review. It is called
-"Investigation Priority Score" and must never be called criminal/guilt/
-crime/threat probability — the words do not appear in this module except
-in this paragraph.
-
-Score reasons are generated from actual component values only; causality
-is never claimed.
-"""
+"""Investigation Priority Scoring engine implementing PROJECT_SPEC.md §9 and AGENTS.md §5."""
 
 from __future__ import annotations
 
-from .centrality import sanitize_score
-from .validation import IngestionError
+from typing import Any, Dict, List
+from app.config import WEIGHT_PAGERANK, WEIGHT_BETWEENNESS, WEIGHT_ANOMALY
 
-WEIGHT_PAGERANK = 0.35
-WEIGHT_BETWEENNESS = 0.35
-WEIGHT_ANOMALY = 0.30
-FORMULA = "0.35 × PageRank + 0.35 × Betweenness + 0.30 × Anomaly Score"
-FORMULA_VERSION = "v1"
-DISCLAIMER = ("Investigation-priority indicator only. Not probability of "
-              "criminality, guilt, proof of criminal activity, or "
-              "future-crime prediction.")
+LEGAL_DISCLAIMER = (
+    "Investigation Priority Score is an analytical triage indicator designed for evidence prioritization. "
+    "It does NOT represent guilt, proof of criminal activity, or probability of criminality."
+)
 
-PR_THRESHOLD = 0.7
-BW_THRESHOLD = 0.7
-ANOMALY_THRESHOLD = 0.7
+def calculate_priority_score(
+    pagerank: float, betweenness: float, anomaly_score: float
+) -> float:
+    """Calculates weighted Investigation Priority Score: 0.35*PR + 0.35*BW + 0.30*Anomaly."""
+    pr_norm = max(0.0, min(1.0, float(pagerank)))
+    bw_norm = max(0.0, min(1.0, float(betweenness)))
+    an_norm = max(0.0, min(1.0, float(anomaly_score)))
 
+    score = (
+        (WEIGHT_PAGERANK * pr_norm)
+        + (WEIGHT_BETWEENNESS * bw_norm)
+        + (WEIGHT_ANOMALY * an_norm)
+    )
+    return round(max(0.0, min(1.0, score)), 4)
 
-def _component(value: object, name: str) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError) as exc:
-        raise IngestionError("INVALID_SCORE",
-                             f"{name} must be numeric.",
-                             http_status=422) from exc
-    return sanitize_score(number)
+def generate_explanation(
+    entity_id: str,
+    canonical_name: str,
+    pagerank: float,
+    betweenness: float,
+    anomaly_score: float,
+    priority_score: float,
+    top_features: List[str],
+    reasons: List[str],
+) -> Dict[str, Any]:
+    """Generates explainable rationale for priority score."""
+    explanation_reasons = list(reasons)
+    if pagerank >= 0.6:
+        explanation_reasons.append("High network connectivity (PageRank)")
+    if betweenness >= 0.6:
+        explanation_reasons.append("High betweenness centrality (broker / bridge position)")
 
-
-def priority_score(pagerank: float, betweenness: float,
-                   anomaly: float) -> dict:
-    """Combine normalized components. Returns::
-
-        {"score": [0,1] rounded to 4dp, "priority": int 0-100,
-         "components": {...}, "reasons": [...]}
-    """
-    pr = _component(pagerank, "pagerank")
-    bw = _component(betweenness, "betweenness")
-    an = _component(anomaly, "anomaly")
-    score = round(WEIGHT_PAGERANK * pr + WEIGHT_BETWEENNESS * bw +
-                  WEIGHT_ANOMALY * an, 4)
-    return {"score": score, "priority": int(round(score * 100)),
-            "components": {"pagerank": pr, "betweenness": bw,
-                           "anomaly_score": an},
-            "reasons": explain_score(pr, bw, an)}
-
-
-def explain_score(pagerank: float, betweenness: float, anomaly: float,
-                  high_degree: bool = False,
-                  community_size: int = 0) -> list[str]:
-    """Reasons drawn strictly from the supplied values."""
-    reasons = []
-    if pagerank >= PR_THRESHOLD:
-        reasons.append("High structural importance in the network")
-    if betweenness >= BW_THRESHOLD:
-        reasons.append("Acts as a bridge between network groups")
-    if anomaly >= ANOMALY_THRESHOLD:
-        reasons.append("Unusual activity pattern")
-    if high_degree:
-        reasons.append("Highly connected entity")
-    if community_size >= 3:
-        reasons.append("Connected to a dense network group")
-    return reasons
+    return {
+        "entity_id": entity_id,
+        "canonical_name": canonical_name,
+        "priority_score": priority_score,
+        "components": {
+            "pagerank": pagerank,
+            "betweenness": betweenness,
+            "anomaly_score": anomaly_score,
+            "weights": {
+                "pagerank": WEIGHT_PAGERANK,
+                "betweenness": WEIGHT_BETWEENNESS,
+                "anomaly": WEIGHT_ANOMALY,
+            },
+        },
+        "top_features": top_features,
+        "reasons": explanation_reasons,
+        "disclaimer": LEGAL_DISCLAIMER,
+    }
