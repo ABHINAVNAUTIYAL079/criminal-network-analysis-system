@@ -726,16 +726,44 @@ let fastApiProcess: ChildProcess | null = null;
 
 function ensureFastApiProcess() {
   const checkReq = http.get("http://127.0.0.1:8000/health", (res) => {
-    // FastAPI is already running
+    // FastAPI is already running — nothing to do.
+    res.resume();
   });
   checkReq.on("error", () => {
-    console.log("[FastAPI] Starting Python backend on http://127.0.0.1:8000...");
-    fastApiProcess = spawn("python3", ["-m", "uvicorn", "app.main:app", "--app-dir", "backend", "--host", "127.0.0.1", "--port", "8000"], {
-      stdio: "inherit",
-      env: { ...process.env },
-    });
+    // FastAPI not reachable — attempt to start it.
+    // Resolve the venv Python executable path for Windows; fall back to "python".
+    const venvPython = path.join(process.cwd(), "backend", ".venv", "Scripts", "python.exe");
+    const pythonCmd = fs.existsSync(venvPython) ? venvPython : (process.platform === "win32" ? "python" : "python3");
+    console.log(`[FastAPI] Starting Python backend with: ${pythonCmd}`);
+
+    // Load .env values into the child process environment so JWT_SECRET etc. are available.
+    const envFile = path.join(process.cwd(), ".env");
+    const childEnv: Record<string, string> = { ...process.env } as Record<string, string>;
+    if (fs.existsSync(envFile)) {
+      const envContents = fs.readFileSync(envFile, "utf-8");
+      for (const line of envContents.split(/\r?\n/)) {
+        const match = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+        if (match) {
+          childEnv[match[1]] = match[2].replace(/^["']|["']$/g, "");
+        }
+      }
+    }
+
+    fastApiProcess = spawn(
+      pythonCmd,
+      ["-m", "uvicorn", "app.main:app", "--app-dir", "backend", "--host", "127.0.0.1", "--port", "8000"],
+      {
+        stdio: "inherit",
+        env: childEnv,
+        cwd: process.cwd(),
+      }
+    );
     fastApiProcess.on("error", (err) => {
-      console.error("[FastAPI] Failed to start Python backend:", err);
+      console.error(
+        "[FastAPI] Failed to start Python backend:",
+        err.message,
+        `\n[FastAPI] Please start it manually: cd backend && ../.venv/Scripts/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000`
+      );
     });
     fastApiProcess.on("exit", (code, signal) => {
       console.log(`[FastAPI] Backend exited (code: ${code}, signal: ${signal})`);
